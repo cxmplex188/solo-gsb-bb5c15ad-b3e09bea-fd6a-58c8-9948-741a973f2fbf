@@ -75,6 +75,17 @@ def invalid_business_calendar(message: str) -> APIError:
     )
 
 
+def invalid_override(
+    message: str, details: list[dict[str, Any]] | None = None
+) -> APIError:
+    """A bad one-off ``overrides`` entry (unknown/duplicate/EXDATEd original)."""
+    return APIError(
+        code="invalid_override",
+        message=f"Invalid occurrence override: {message}",
+        details=details,
+    )
+
+
 def invalid_busy_interval(message: str) -> APIError:
     """A malformed ``busy_intervals`` entry (missing offset, empty range, ...)."""
     return APIError(

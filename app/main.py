@@ -15,6 +15,7 @@ from .engine import (
     expand_available_occurrences,
     expand_business_occurrences,
     expand_occurrences,
+    expand_override_occurrences,
 )
 from .errors import APIError
 from .schemas import (
@@ -25,6 +26,8 @@ from .schemas import (
     HealthResponse,
     OccurrenceRequest,
     OccurrenceResponse,
+    OverrideOccurrenceRequest,
+    OverrideOccurrenceResponse,
 )
 
 app = FastAPI(
@@ -100,6 +103,35 @@ async def health() -> HealthResponse:
 async def occurrences(request: OccurrenceRequest) -> OccurrenceResponse:
     result = expand_occurrences(request.model_dump(), max_occurrences=_max_occurrences())
     return OccurrenceResponse(**result)
+
+
+@app.post(
+    "/override-occurrences",
+    response_model=OverrideOccurrenceResponse,
+    tags=["occurrences"],
+    summary="Expand a recurrence rule with one-off cancel/replace exceptions",
+    description=(
+        "Expands exactly like `/occurrences` but applies the `overrides` list "
+        "first: each item locates one DTSTART/RRULE/RDATE wall-clock instance "
+        "by its unique `original_local` (validated before query-window "
+        "clipping and against EXDATE) and either cancels it or replaces it "
+        "with `replacement_local`, which is itself resolved with `dst_policy`. "
+        "An instance originally outside the window can therefore be "
+        "rescheduled into it. The final set is sorted and de-duplicated by "
+        "UTC instant: rescheduled instances win every collision (ties resolve "
+        "to the earlier `original_local`). Every result carries "
+        "`original_local` and `action` ('keep'/'replace'); cancelled "
+        "instances never appear. Unknown, duplicated or EXDATEd "
+        "`original_local` values return a structured `invalid_override` error."
+    ),
+)
+async def override_occurrences(
+    request: OverrideOccurrenceRequest,
+) -> OverrideOccurrenceResponse:
+    result = expand_override_occurrences(
+        request.model_dump(), max_occurrences=_max_occurrences()
+    )
+    return OverrideOccurrenceResponse(**result)
 
 
 @app.post(

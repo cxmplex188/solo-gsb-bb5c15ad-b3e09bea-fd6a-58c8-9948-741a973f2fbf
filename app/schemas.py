@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, confloat
+from pydantic import BaseModel, Field, confloat, model_validator
 
 
 class DstPolicy(BaseModel):
@@ -86,6 +86,69 @@ class OccurrenceRequest(BaseModel):
             "Optional DST resolution policy applied to DTSTART, RRULE and RDATE "
             "(EXDATE always matches the original local wall time). "
             "Defaults to {'gap': 'skip', 'fold': 'both'}."
+        ),
+    )
+
+
+class OccurrenceOverride(BaseModel):
+    """A one-off exception applied to a single expanded wall-clock instance.
+
+    ``original_local`` uniquely identifies one DTSTART/RRULE/RDATE wall-clock
+    instance in the requested ``timezone`` (naive ISO-8601, like
+    ``start_local``). ``action`` is ``cancel`` (the instance disappears, as
+    with a one-off EXDATE) or ``replace`` (the instance is rescheduled to
+    ``replacement_local``); the replacement time is itself resolved with the
+    request ``dst_policy``.
+    """
+
+    original_local: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "The local wall-clock instance to override; it must match a "
+            "DTSTART, RRULE or RDATE instance of the recurrence set exactly "
+            "(before query-window clipping and before any gap shift)."
+        ),
+        examples=["2025-01-02T09:00:00"],
+    )
+    action: Literal["cancel", "replace"] = Field(
+        ...,
+        description="'cancel' drops the instance; 'replace' reschedules it to replacement_local.",
+    )
+    replacement_local: str | None = Field(
+        default=None,
+        min_length=1,
+        description=(
+            "Required when action is 'replace': the new local wall-clock time "
+            "(resolved with the request dst_policy). Must be absent for 'cancel'."
+        ),
+        examples=["2025-01-02T14:00:00"],
+    )
+
+    @model_validator(mode="after")
+    def _check_replacement(self) -> OccurrenceOverride:
+        if self.action == "replace" and not self.replacement_local:
+            raise ValueError("replacement_local is required when action is 'replace'")
+        if self.action == "cancel" and self.replacement_local is not None:
+            raise ValueError("replacement_local must not be given when action is 'cancel'")
+        return self
+
+
+class OverrideOccurrenceRequest(OccurrenceRequest):
+    """Body of ``POST /override-occurrences``.
+
+    Extends :class:`OccurrenceRequest` with ``overrides``: one-off exceptions
+    applied to individual wall-clock instances *before* the query window is
+    applied, so an instance originally outside the window can be rescheduled
+    into it.
+    """
+
+    overrides: list[OccurrenceOverride] = Field(
+        default_factory=list,
+        description=(
+            "One-off exceptions keyed by original_local wall time; each "
+            "original_local may appear at most once and must denote an "
+            "existing instance not already removed by EXDATE."
         ),
     )
 
@@ -201,6 +264,31 @@ class OccurrenceResponse(BaseModel):
     timezone: str
     count: int
     occurrences: list[Occurrence]
+
+
+class OverrideOccurrence(Occurrence):
+    original_local: str = Field(
+        ...,
+        description=(
+            "The original local wall-clock instance this result derives from. "
+            "For a regular instance this equals its own wall time; for a "
+            "replacement this is the wall time that was rescheduled (the "
+            "pre-gap-shift wall time when that original hit a DST gap)."
+        ),
+    )
+    action: Literal["keep", "replace"] = Field(
+        ...,
+        description=(
+            "'replace' for a rescheduled instance; 'keep' for an untouched "
+            "instance. Cancelled instances never appear in the response."
+        ),
+    )
+
+
+class OverrideOccurrenceResponse(BaseModel):
+    timezone: str
+    count: int
+    occurrences: list[OverrideOccurrence]
 
 
 class BusinessOccurrence(Occurrence):
