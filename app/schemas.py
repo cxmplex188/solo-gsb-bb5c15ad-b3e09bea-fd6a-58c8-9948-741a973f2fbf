@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, confloat
+from pydantic import BaseModel, Field, confloat, model_validator
 
 
 class DstPolicy(BaseModel):
@@ -86,6 +86,72 @@ class OccurrenceRequest(BaseModel):
             "Optional DST resolution policy applied to DTSTART, RRULE and RDATE "
             "(EXDATE always matches the original local wall time). "
             "Defaults to {'gap': 'skip', 'fold': 'both'}."
+        ),
+    )
+
+
+class OverrideItem(BaseModel):
+    """One single-instance override for ``POST /override-occurrences``.
+
+    ``original_local`` uniquely identifies one raw DTSTART/RRULE/RDATE
+    wall-clock instance of the recurrence set; ``action`` decides whether that
+    instance is cancelled or moved to ``replacement_local``.
+    """
+
+    original_local: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Local wall time (in the request time zone) of the DTSTART/RRULE/RDATE "
+            "instance to override. Strings carrying an explicit offset are "
+            "converted to the zone's wall time first."
+        ),
+        examples=["2025-01-03T09:00:00"],
+    )
+    action: Literal["cancel", "replace"] = Field(
+        ...,
+        description=(
+            "'cancel' removes the instance; 'replace' moves it to "
+            "'replacement_local'."
+        ),
+    )
+    replacement_local: str | None = Field(
+        default=None,
+        description=(
+            "New local wall time for the instance. Required when action='replace'; "
+            "must be omitted when action='cancel'. The replacement is resolved "
+            "with the request's dst_policy."
+        ),
+        examples=["2025-01-04T15:30:00"],
+    )
+
+    @model_validator(mode="after")
+    def _check_replacement_local(self) -> "OverrideItem":
+        if self.action == "replace" and not self.replacement_local:
+            raise ValueError("replacement_local is required when action='replace'")
+        if self.action == "cancel" and self.replacement_local is not None:
+            raise ValueError("replacement_local must be omitted when action='cancel'")
+        return self
+
+
+class OverrideOccurrenceRequest(OccurrenceRequest):
+    """Body of ``POST /override-occurrences``.
+
+    All :class:`OccurrenceRequest` fields keep their meaning; ``overrides``
+    lists single-instance exceptions that are applied to the raw wall-clock
+    instances *before* the query window is enforced.
+    """
+
+    overrides: list[OverrideItem] = Field(
+        default_factory=list,
+        description=(
+            "Single-instance exceptions. Each entry locates one raw "
+            "DTSTART/RRULE/RDATE wall-clock instance by 'original_local' and "
+            "cancels it or moves it to 'replacement_local'. Entries are applied "
+            "before the query window is enforced, so an out-of-window instance "
+            "rescheduled into the window is still returned. An 'original_local' "
+            "that matches no instance, is configured twice, or is already "
+            "excluded by EXDATE is rejected with an 'invalid_override' error."
         ),
     )
 
@@ -201,6 +267,33 @@ class OccurrenceResponse(BaseModel):
     timezone: str
     count: int
     occurrences: list[Occurrence]
+
+
+class OverrideOccurrence(Occurrence):
+    """An occurrence annotated with its override provenance."""
+
+    original_local: str = Field(
+        ...,
+        description=(
+            "The raw DTSTART/RRULE/RDATE wall-clock time this occurrence stems "
+            "from. Equals 'local' for untouched instances (unless a gap shift "
+            "moved 'local'); for a rescheduled instance it is the overridden "
+            "original wall time."
+        ),
+    )
+    action: Literal["keep", "replace"] = Field(
+        ...,
+        description=(
+            "'replace' when the occurrence was produced by an override "
+            "(cancelled instances are removed and never appear); 'keep' otherwise."
+        ),
+    )
+
+
+class OverrideOccurrenceResponse(BaseModel):
+    timezone: str
+    count: int
+    occurrences: list[OverrideOccurrence]
 
 
 class BusinessOccurrence(Occurrence):

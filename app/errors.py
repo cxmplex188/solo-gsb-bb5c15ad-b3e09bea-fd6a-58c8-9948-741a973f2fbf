@@ -83,6 +83,14 @@ def invalid_busy_interval(message: str) -> APIError:
     )
 
 
+def invalid_override(message: str) -> APIError:
+    """A malformed ``overrides`` entry (unknown, duplicate or EXDATE-excluded target)."""
+    return APIError(
+        code="invalid_override",
+        message=f"Invalid override: {message}",
+    )
+
+
 def invalid_duration(message: str) -> APIError:
     """Bad ``duration_minutes`` value; rendered as the unified 422 error."""
     return APIError(

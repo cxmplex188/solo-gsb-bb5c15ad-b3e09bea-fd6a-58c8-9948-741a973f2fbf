@@ -15,6 +15,7 @@ from .engine import (
     expand_available_occurrences,
     expand_business_occurrences,
     expand_occurrences,
+    expand_override_occurrences,
 )
 from .errors import APIError
 from .schemas import (
@@ -25,6 +26,8 @@ from .schemas import (
     HealthResponse,
     OccurrenceRequest,
     OccurrenceResponse,
+    OverrideOccurrenceRequest,
+    OverrideOccurrenceResponse,
 )
 
 app = FastAPI(
@@ -34,7 +37,9 @@ app = FastAPI(
         "occurrences inside a UTC query window, with correct IANA time-zone, "
         "DST gap and repeated-wall-time (fold) handling. DST resolution is "
         "configurable per request via `dst_policy`: `gap` = `skip` (default) or "
-        "`shift_forward`; `fold` = `both` (default), `earlier` or `later`."
+        "`shift_forward`; `fold` = `both` (default), `earlier` or `later`. "
+        "Single-instance exceptions (cancel/replace) are supported via "
+        "`/override-occurrences`."
     ),
     version=__version__,
 )
@@ -100,6 +105,33 @@ async def health() -> HealthResponse:
 async def occurrences(request: OccurrenceRequest) -> OccurrenceResponse:
     result = expand_occurrences(request.model_dump(), max_occurrences=_max_occurrences())
     return OccurrenceResponse(**result)
+
+
+@app.post(
+    "/override-occurrences",
+    response_model=OverrideOccurrenceResponse,
+    tags=["occurrences"],
+    summary="Expand a recurrence rule with single-instance overrides (cancel/replace)",
+    description=(
+        "Expands DTSTART/RRULE/RDATE exactly like `/occurrences` (same RRULE, "
+        "time-zone, EXDATE and `dst_policy` gap/fold semantics), then applies "
+        "single-instance exceptions from `overrides`. Each entry locates one raw "
+        "wall-clock instance by `original_local` and either `cancel`s it or "
+        "`replace`s it with `replacement_local` (resolved with the same "
+        "`dst_policy`). Overrides are applied *before* the query window is "
+        "enforced, so an instance originally outside the window can be "
+        "rescheduled into it. An `original_local` that matches no instance, is "
+        "configured twice, or is already excluded by EXDATE is rejected with an "
+        "`invalid_override` error. Results are sorted by UTC instant and "
+        "de-duplicated with rescheduled instances winning collisions; every "
+        "occurrence reports `original_local` and `action` (`keep`/`replace`)."
+    ),
+)
+async def override_occurrences(request: OverrideOccurrenceRequest) -> OverrideOccurrenceResponse:
+    result = expand_override_occurrences(
+        request.model_dump(), max_occurrences=_max_occurrences()
+    )
+    return OverrideOccurrenceResponse(**result)
 
 
 @app.post(

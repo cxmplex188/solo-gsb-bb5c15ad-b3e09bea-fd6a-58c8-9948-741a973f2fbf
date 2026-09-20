@@ -12,6 +12,9 @@
     `fold: 0/1` 与对应偏移），也可只保留较早一侧（`"earlier"`）或较晚一侧（`"later"`）
 - 支持月末规则（`BYMONTHDAY=-1`）、带索引星期（`BYDAY=-1FR`）、`COUNT`/`UNTIL`、
   排除日期（EXDATE）与补充日期（RDATE）
+- `POST /override-occurrences` 在 `/occurrences` 之上支持**单次例外**：用
+  `original_local` 定位某个原始实例后取消（`cancel`）或改期（`replace`），
+  例外在查询窗口裁剪**之前**生效，窗口外实例改期进入窗口仍可返回
 - `POST /business-occurrences` 额外支持把每个原始实例按 `following` /
   `preceding` / `modified_following` 约定调整到营业日（自定义节假日与周末、
   保持时分秒），同一 UTC 时刻合并并通过 `originals` 回溯原始实例
@@ -34,10 +37,10 @@ docker compose up --build -d
 - 交互式 API 文档（Swagger UI）：http://localhost:8000/docs
 - 停止服务：`docker compose down`
 
-一条命令启动并验证（构建、起服务、调用新端点）：
+一条命令启动并验证（构建、起服务、调用单次例外端点）：
 
 ```bash
-docker compose up --build -d && sleep 3 && curl -s -X POST http://localhost:8000/available-occurrences -H 'Content-Type: application/json' -d '{"timezone":"UTC","start_local":"2025-01-01T09:00:00","rrule":"FREQ=DAILY;COUNT=2","duration_minutes":60,"busy_intervals":[{"start":"2025-01-01T09:30:00Z","end":"2025-01-01T10:30:00Z"}],"interval_start":"2025-01-01T00:00:00Z","interval_end":"2025-01-03T00:00:00Z"}'
+docker compose up --build -d && sleep 3 && curl -s -X POST http://localhost:8000/override-occurrences -H 'Content-Type: application/json' -d '{"timezone":"UTC","start_local":"2025-01-01T09:00:00","rrule":"FREQ=DAILY;COUNT=10","interval_start":"2025-01-01T00:00:00Z","interval_end":"2025-01-04T00:00:00Z","overrides":[{"original_local":"2025-01-02T09:00:00","action":"cancel"},{"original_local":"2025-01-10T09:00:00","action":"replace","replacement_local":"2025-01-03T15:30:00"}]}'
 ```
 
 端口映射在 `docker-compose.yml` 中固定为宿主机 **8000** → 容器 **8000**
@@ -93,6 +96,48 @@ docker compose up --build -d && sleep 3 && curl -s -X POST http://localhost:8000
 | `dst` | 该时刻是否处于夏令时 |
 | `fold` | `0` = 普通时刻/重复时间的第一次；`1` = 重复时间的第二次 |
 | `source` | `rrule`（规则产生）或 `rdate`（补充日期产生） |
+
+### `POST /override-occurrences`
+
+在 `/occurrences` 的**全部字段与语义**之上新增**单次例外**：每个例外用
+`original_local` 唯一定位一个 DTSTART / RRULE / RDATE 原始墙钟实例，然后取消
+（`cancel`）或改期（`replace`）。
+
+新增字段：
+
+| 字段 | 必填 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `overrides` | 否 | `[]` | 单次例外列表，每项为 `{"original_local", "action", "replacement_local"?}` |
+
+`overrides` 条目字段：
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `original_local` | 是 | 要定位的原始实例墙钟时间（目标时区；带偏移的字符串先换算成该时区墙钟时间） |
+| `action` | 是 | `cancel`（取消该实例）或 `replace`（改期到 `replacement_local`） |
+| `replacement_local` | `replace` 时必填 | 改期后的新墙钟时间；`action` 为 `cancel` 时不可提供 |
+
+语义说明：
+
+1. 例外在**查询窗口裁剪之前**作用于原始墙钟实例：窗口外的原实例改期进入窗口
+   仍会返回，窗口内实例改期出窗口则消失；扫描窗口会自动扩展到覆盖所有
+   `original_local` 与 `replacement_local`
+2. `original_local` 不存在（不匹配任何 DTSTART/RRULE/RDATE 原始实例）、同一
+   `original_local` 被重复配置（按换算后的墙钟时间判重）、或目标实例已被
+   EXDATE 排除时，返回 400 `invalid_override`（结构化错误）
+3. EXDATE 仍只匹配**原始**墙钟时间（不匹配 `replacement_local`）
+4. 替换时间继续遵循 `dst_policy`：落入跳时缺口默认跳过、`shift_forward` 时顺延；
+   落入回拨重复时段按 `fold` 策略返回一条或两条
+5. 结果按 UTC 升序去重：改期实例与普通实例落到同一 UTC 时刻时**改期实例优先**
+   （普通实例之间仍是 RRULE 优先于 RDATE；多个改期撞到同一时刻时先配置者优先）
+6. 每个实例新增 `original_local` 与 `action` 两个字段（见下）；被取消的实例不出现在结果中
+
+返回的每个实例在 `/occurrences` 字段基础上新增：
+
+| 字段 | 说明 |
+| --- | --- |
+| `original_local` | 该实例来源的原始墙钟时间：未改动实例为自身原始墙钟时间（gap 顺延时 `local` 为顺延后时间、`original_local` 仍为原始请求时间）；改期实例为被覆盖的原始墙钟时间 |
+| `action` | `keep`（未改动）或 `replace`（由改期例外产生） |
 
 ### `POST /business-occurrences`
 
@@ -335,6 +380,48 @@ curl -s -X POST http://localhost:8000/occurrences \
 - `UNTIL` 同时接受 UTC（`...Z`）、显式偏移与目标时区本地时间，
   内部统一换算为目标时区墙钟时间后比较；`COUNT` 与 `UNTIL` 互斥
 
+### 单次例外：取消 + 窗口外改期
+
+UTC 每日 09:00 共 10 次（1 月 1–10 日），查询窗口只覆盖 1 月 1–3 日。
+取消 1 月 2 日的实例，并把**窗口外**的 1 月 10 日实例改期到 1 月 3 日 15:30
+（例外在窗口裁剪前生效，因此改期进入窗口的实例仍会返回）：
+
+```bash
+curl -s -X POST http://localhost:8000/override-occurrences \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "timezone": "UTC",
+    "start_local": "2025-01-01T09:00:00",
+    "rrule": "FREQ=DAILY;COUNT=10",
+    "interval_start": "2025-01-01T00:00:00Z",
+    "interval_end": "2025-01-04T00:00:00Z",
+    "overrides": [
+      {"original_local": "2025-01-02T09:00:00", "action": "cancel"},
+      {"original_local": "2025-01-10T09:00:00", "action": "replace",
+       "replacement_local": "2025-01-03T15:30:00"}
+    ]
+  }'
+```
+
+```json
+{
+  "timezone": "UTC",
+  "count": 3,
+  "occurrences": [
+    {"local": "2025-01-01T09:00:00", "utc": "2025-01-01T09:00:00Z", "utc_offset": "+00:00", "dst": false, "fold": 0, "source": "rrule",
+     "original_local": "2025-01-01T09:00:00", "action": "keep"},
+    {"local": "2025-01-03T09:00:00", "utc": "2025-01-03T09:00:00Z", "utc_offset": "+00:00", "dst": false, "fold": 0, "source": "rrule",
+     "original_local": "2025-01-03T09:00:00", "action": "keep"},
+    {"local": "2025-01-03T15:30:00", "utc": "2025-01-03T15:30:00Z", "utc_offset": "+00:00", "dst": false, "fold": 0, "source": "rrule",
+     "original_local": "2025-01-10T09:00:00", "action": "replace"}
+  ]
+}
+```
+
+改期目标若落在 DST 缺口/回拨中，仍由 `dst_policy` 决定跳过、顺延或保留哪次
+（与 `/occurrences` 对 DTSTART/RRULE/RDATE 的处理完全一致）；`original_local`
+不存在、重复配置或已被 EXDATE 排除时返回 400 `invalid_override`。
+
 ### 营业日：following 调整与合并
 
 上海时间每日 09:30，共 5 个原始实例（2024-12-31 至 2025-01-04），把元旦
@@ -517,7 +604,8 @@ curl -s -X POST http://localhost:8000/available-occurrences \
 | 400 | `invalid_datetime` | 时间字段语法错误，或查询区间、`busy_intervals` 端点缺少 UTC 偏移 |
 | 400 | `too_many_occurrences` | 展开实例数/扫描量超过 `APP_MAX_OCCURRENCES` |
 | 400 | `invalid_busy_interval` | `busy_intervals` 条目起点不早于终点（含空区间/反转）（details 指向具体下标，如 `busy_intervals[0]`） |
-| 422 | `validation_error` | 请求体不是合法 JSON、缺少必填字段或字段值非法（如 `dst_policy` 的 `gap`/`fold` 取值不在允许列表内、`weekend_days` 含非法星期或把整周都设为周末、`business_day_convention` 取值非法、`duration_minutes` 缺失或 ≤ 0、`busy_intervals` 条目缺少 `start`/`end`）（含字段级 details） |
+| 400 | `invalid_override` | `overrides` 条目的 `original_local` 不匹配任何 DTSTART/RRULE/RDATE 原始实例、被重复配置，或目标已被 EXDATE 排除（message 含具体下标，如 `overrides[0]`） |
+| 422 | `validation_error` | 请求体不是合法 JSON、缺少必填字段或字段值非法（如 `dst_policy` 的 `gap`/`fold` 取值不在允许列表内、`weekend_days` 含非法星期或把整周都设为周末、`business_day_convention` 取值非法、`duration_minutes` 缺失或 ≤ 0、`busy_intervals` 条目缺少 `start`/`end`、`overrides` 条目 `action` 非法、`replace` 缺少 `replacement_local` 或 `cancel` 多给了 `replacement_local`）（含字段级 details） |
 
 ## 项目结构
 
@@ -532,7 +620,8 @@ curl -s -X POST http://localhost:8000/available-occurrences \
 ├── tests/
 │   ├── test_api.py             # pytest + TestClient 端到端测试
 │   ├── test_business_api.py    # POST /business-occurrences 端到端测试
-│   └── test_available_api.py   # POST /available-occurrences 端到端测试
+│   ├── test_available_api.py   # POST /available-occurrences 端到端测试
+│   └── test_override_api.py    # POST /override-occurrences 端到端测试
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

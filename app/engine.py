@@ -33,6 +33,15 @@ DST transition never changes the slot length). The query window constrains
 the *start only*; each pass of a repeated wall time (fold) is judged
 separately against the supplied busy intervals, which are validated and
 merged (overlapping or touching blocks become one) before filtering.
+
+``expand_override_occurrences`` adds single-instance overrides on top of the
+plain expansion: each ``overrides`` entry locates one raw wall-clock instance
+by ``original_local`` and either cancels it or moves it to
+``replacement_local``. Overrides are applied to the raw wall times *before*
+the query window is enforced, so rescheduling can move an instance into or
+out of the window; the replacement wall time goes through the same
+``dst_policy`` resolution, and on a UTC-instant collision the rescheduled
+instance wins over a regular one.
 """
 
 from __future__ import annotations
@@ -53,6 +62,7 @@ from .errors import (
     invalid_duration,
     invalid_dst_policy,
     invalid_interval,
+    invalid_override,
     invalid_rrule,
     invalid_timezone,
 )
@@ -508,6 +518,197 @@ def expand_occurrences(payload: dict, max_occurrences: int = DEFAULT_MAX_OCCURRE
         _make_output(naive_local, aware, fold, source)
         for _instant, (naive_local, aware, fold, source) in ordered
     ]
+    return {"timezone": tz_name, "count": len(occurrences), "occurrences": occurrences}
+
+
+# ---------------------------------------------------------------- overrides --
+
+_OVERRIDE_ACTIONS = ("cancel", "replace")
+
+
+def _parse_overrides(raw: Any, zone: tzinfo) -> list[tuple[datetime, str, "datetime | None"]]:
+    """Validate the ``overrides`` list and parse its wall times.
+
+    Returns ``[(original_wall, action, replacement_wall | None), ...]`` in
+    request order. The API schema already enforces the shape for HTTP callers;
+    these checks protect direct engine callers and raise the unified
+    ``invalid_override`` error. A duplicate ``original_local`` is rejected here
+    (compared as wall times, after any offset conversion).
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise invalid_override("expected a list of {original_local, action, ...} objects")
+
+    parsed: list[tuple[datetime, str, "datetime | None"]] = []
+    seen: set[datetime] = set()
+    for index, item in enumerate(raw):
+        where = f"overrides[{index}]"
+        if not isinstance(item, dict):
+            raise invalid_override(f"{where} must be an object with 'original_local' and 'action'")
+        action = item.get("action")
+        if action not in _OVERRIDE_ACTIONS:
+            raise invalid_override(f"{where}.action must be one of {list(_OVERRIDE_ACTIONS)}")
+        original_value = item.get("original_local")
+        if not isinstance(original_value, str):
+            raise invalid_override(f"{where}.original_local must be a datetime string")
+        original = parse_local_wall(original_value, f"{where}.original_local", zone)
+        replacement_value = item.get("replacement_local")
+        replacement: datetime | None = None
+        if action == "replace":
+            if not isinstance(replacement_value, str):
+                raise invalid_override(
+                    f"{where}.replacement_local is required when action='replace'"
+                )
+            replacement = parse_local_wall(replacement_value, f"{where}.replacement_local", zone)
+        elif replacement_value is not None:
+            raise invalid_override(
+                f"{where}.replacement_local must be omitted when action='cancel'"
+            )
+        if original in seen:
+            raise invalid_override(
+                f"{where}.original_local {original.isoformat()} is configured more than once"
+            )
+        seen.add(original)
+        parsed.append((original, action, replacement))
+    return parsed
+
+
+def expand_override_occurrences(
+    payload: dict, max_occurrences: int = DEFAULT_MAX_OCCURRENCES
+) -> dict:
+    """Expand a recurrence set with single-instance overrides applied.
+
+    The recurrence set (DTSTART/RRULE/RDATE, EXDATE, time zone, ``dst_policy``)
+    is built exactly like ``/occurrences``, but every ``overrides`` entry first
+    rewrites one raw wall-clock instance, located by ``original_local`` among
+    the DTSTART/RRULE/RDATE instances: ``cancel`` removes it, ``replace`` moves
+    it to ``replacement_local``. Overrides are applied to the raw wall times
+    *before* the query window is enforced, so an instance that originally falls
+    outside the window can be rescheduled into it (and an in-window instance
+    rescheduled out of the window disappears). The replacement wall time is
+    resolved with the same ``dst_policy`` gap/fold rules.
+
+    The result is sorted by UTC instant and de-duplicated; when a rescheduled
+    instance collides with a regular one on the same UTC instant, the
+    rescheduled one wins (then RRULE over RDATE, then first configured). Every
+    occurrence reports ``original_local`` (the raw wall time it stems from) and
+    ``action`` (``replace`` for a rescheduled instance, ``keep`` otherwise).
+    """
+    tz_name = payload["timezone"]
+    zone = get_zone(tz_name)
+
+    lo_utc = parse_aware_bound(payload["interval_start"], "interval_start")
+    hi_utc = parse_aware_bound(payload["interval_end"], "interval_end")
+    if lo_utc >= hi_utc:
+        raise invalid_interval("interval_start must be strictly before interval_end")
+
+    dtstart = parse_local_wall(payload["start_local"], "start_local", zone)
+
+    gap_policy, fold_policy = parse_dst_policy(payload.get("dst_policy"))
+
+    exdates = {
+        parse_local_wall(v, "exdate", zone)
+        for v in payload.get("exdate") or []
+    }
+
+    overrides = _parse_overrides(payload.get("overrides"), zone)
+
+    rdate_walls: set[datetime] = set()
+    for v in payload.get("rdate") or []:
+        rdate_walls.add(parse_local_wall(v, "rdate", zone))
+
+    # Naive wall-time scan window: the query window plus the usual DST margin,
+    # widened to cover every override original/replacement, so that an instance
+    # living outside the query window can be found and rescheduled into it.
+    lo_wall = lo_utc.astimezone(zone).replace(tzinfo=None) - _WINDOW_MARGIN
+    hi_wall = hi_utc.astimezone(zone).replace(tzinfo=None) + _WINDOW_MARGIN
+    for original, _action, replacement in overrides:
+        target = replacement if replacement is not None else original
+        lo_wall = min(lo_wall, original, target)
+        hi_wall = max(hi_wall, original, target)
+
+    # Raw recurrence set (EXDATE not applied yet) keyed by wall time, so that
+    # overrides can locate their target; RRULE wins over RDATE on collision.
+    raw: dict[datetime, str] = {}
+    raw_rule = payload.get("rrule")
+    if raw_rule:
+        rule, dtstart_microsecond = build_rrule(raw_rule, dtstart, zone)
+        rule_walls = _scan_rule_walls(
+            rule, dtstart_microsecond, lo_wall, hi_wall, max_occurrences
+        )
+        for wall in rule_walls:
+            raw[wall] = "rrule"
+    elif lo_wall <= dtstart <= hi_wall:
+        # Without an RRULE the recurrence set still contains DTSTART (RFC 5545).
+        raw[dtstart] = "rrule"
+
+    if len(rdate_walls) > max_occurrences:
+        raise APIError(
+            code="too_many_occurrences",
+            message=f"More than {max_occurrences} RDATE entries were supplied.",
+        )
+    for wall in rdate_walls:
+        if lo_wall <= wall <= hi_wall and wall not in raw:
+            raw[wall] = "rdate"
+
+    # Validate overrides against the raw set: the target instance must exist
+    # and must not already be excluded by EXDATE.
+    for index, (original, _action, _replacement) in enumerate(overrides):
+        if original not in raw:
+            raise invalid_override(
+                f"overrides[{index}].original_local {original.isoformat()} does not "
+                "match any DTSTART/RRULE/RDATE instance"
+            )
+        if original in exdates:
+            raise invalid_override(
+                f"overrides[{index}].original_local {original.isoformat()} is already "
+                "excluded by EXDATE"
+            )
+
+    cancelled = {original for original, action, _ in overrides if action == "cancel"}
+    moved = {original for original, action, _ in overrides if action == "replace"}
+
+    # Effective instances: (wall time to resolve, source, original wall, action).
+    effective: list[tuple[datetime, str, datetime, str]] = [
+        (wall, source, wall, "keep")
+        for wall, source in raw.items()
+        if wall not in exdates and wall not in cancelled and wall not in moved
+    ]
+    for original, action, replacement in overrides:
+        if action == "replace":
+            effective.append((replacement, raw[original], original, "replace"))
+
+    # Dedupe priority on a UTC-instant collision: a rescheduled instance wins
+    # over a regular one, then RRULE over RDATE, then the first entry wins.
+    def _priority(action: str, source: str) -> int:
+        if action == "replace":
+            return 0
+        return 1 if source == "rrule" else 2
+
+    # instant -> (priority, local_wall, aware, fold, source, original_wall, action)
+    chosen: dict[datetime, tuple[int, datetime, datetime, int, str, datetime, str]] = {}
+    for wall, source, original, action in effective:
+        for local_wall, aware, fold in resolve_wall(
+            wall, zone, gap=gap_policy, fold=fold_policy
+        ):
+            instant = aware.astimezone(timezone.utc)
+            if not (lo_utc <= instant < hi_utc):
+                continue
+            priority = _priority(action, source)
+            existing = chosen.get(instant)
+            if existing is None or priority < existing[0]:
+                chosen[instant] = (
+                    priority, local_wall, aware, fold, source, original, action,
+                )
+
+    ordered = sorted(chosen.items(), key=lambda item: (item[0], item[1][3]))
+    occurrences = []
+    for _instant, (_prio, local_wall, aware, fold, source, original, action) in ordered:
+        output = _make_output(local_wall, aware, fold, source)
+        output["original_local"] = original.isoformat()
+        output["action"] = action
+        occurrences.append(output)
     return {"timezone": tz_name, "count": len(occurrences), "occurrences": occurrences}
 
 
